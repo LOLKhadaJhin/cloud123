@@ -55,10 +55,14 @@ http://IP:1234/get/abc/1.txt
 5、缓存目录
 
 ```
+当文件夹删除重建时最好删除缓存
+
 假设根目录下有文件夹abc需要缓存
-http://localhost:5000/cache/save_folder?path=/adc
+http://IP:1234/cache/save_folder?path=/adc
 删除文件夹abc缓存
-http://localhost:5000/cache/delete?path=/adc
+http://IP:1234/cache/delete?path=/adc
+删除全部缓存
+http://IP:1234/cache/clear
 ```
 
 6、FastEmby 配置

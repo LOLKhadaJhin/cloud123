@@ -51,7 +51,8 @@ def init_db():
                  id INTEGER PRIMARY KEY,
                  path TEXT UNIQUE,
                  file_id INTEGER,
-                 is_directory INTEGER)''')
+                 is_directory INTEGER,
+                 last_verified REAL)''')
 
     # 创建索引
     c.execute("CREATE INDEX IF NOT EXISTS idx_path ON path_mapping (path)")
@@ -118,6 +119,7 @@ def get_access_token():
     # 从环境变量获取客户端凭证
     client_id = os.environ.get("PAN123_CLIENT_ID")
     client_secret = os.environ.get("PAN123_CLIENT_SECRET")
+
     if not client_id or not client_secret:
         raise Exception("未配置PAN123_CLIENT_ID或PAN123_CLIENT_SECRET")
 
@@ -193,14 +195,24 @@ def get_file_list_from_api(parent_file_id):
         # 发送API请求
         response = requests.get(url, headers=headers)
         if response.status_code != 200:
+            # 如果是404错误，可能是目录被删除
+            if response.status_code == 404:
+                logger.warning(f"目录不存在: {parent_file_id}")
+                raise FileNotFoundError(f"目录不存在: {parent_file_id}")
             raise Exception(f"API请求失败: HTTP {response.status_code}")
 
         data = response.json()
         if data['code'] != 0:
+            # 特定错误码处理：文件不存在
+            if data['code'] in [10004, 404]:
+                logger.warning(f"API返回目录不存在: {parent_file_id}")
+                raise FileNotFoundError(f"目录不存在: {parent_file_id}")
             raise Exception(f"API错误: {data['message']}")
 
-        # 添加当前页数据
-        items.extend(data['data']['fileList'])
+        # 添加当前页数据，过滤掉已删除的项目
+        for item in data['data']['fileList']:
+            if item.get('trashed', 0) == 0:  # 只处理未删除的项目
+                items.append(item)
 
         # 检查是否还有下一页
         last_file_id = data['data']['lastFileId']
@@ -208,6 +220,25 @@ def get_file_list_from_api(parent_file_id):
             break
 
     return items
+
+
+def get_parent_directory_id(file_id):
+    """获取父目录ID"""
+    logger.info(f"获取父目录ID: {file_id}")
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    # 尝试从文件表获取
+    c.execute("SELECT parent_id FROM files WHERE file_id = ?", (file_id,))
+    row = c.fetchone()
+
+    if not row:
+        # 尝试从目录表获取
+        c.execute("SELECT parent_id FROM directories WHERE file_id = ?", (file_id,))
+        row = c.fetchone()
+
+    conn.close()
+    return row[0] if row else None
 
 
 def cache_directory_contents(parent_id, items):
@@ -222,8 +253,11 @@ def cache_directory_contents(parent_id, items):
             VALUES (?, ?, ?, ?)
         """, (parent_id, parent_id, time.time(), json.dumps(items)))
 
-        # 缓存每个文件和子目录
+        # 缓存每个文件和子目录（只缓存未删除的项目）
         for item in items:
+            if item.get('trashed', 0) == 1:
+                continue  # 跳过已删除项目
+
             # 缓存到文件表
             c.execute("""
                 INSERT OR REPLACE INTO files (
@@ -245,9 +279,9 @@ def cache_directory_contents(parent_id, items):
 
             if path:
                 c.execute("""
-                    INSERT OR REPLACE INTO path_mapping (path, file_id, is_directory)
-                    VALUES (?, ?, ?)
-                """, (path.lower(), item['fileId'], is_dir))
+                    INSERT OR REPLACE INTO path_mapping (path, file_id, is_directory, last_verified)
+                    VALUES (?, ?, ?, ?)
+                """, (path.lower(), item['fileId'], is_dir, time.time()))
 
         conn.commit()
     except sqlite3.Error as e:
@@ -257,7 +291,7 @@ def cache_directory_contents(parent_id, items):
 
 
 def get_cached_directory(parent_id):
-    """从SQLite获取缓存的目录内容"""
+    """从SQLite获取缓存的目录内容（过滤已删除项目）"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
 
@@ -269,7 +303,11 @@ def get_cached_directory(parent_id):
         data, last_updated = row
         # 检查缓存是否过期（5分钟）
         if time.time() - last_updated < 300:
-            return json.loads(data)
+            items = json.loads(data)
+            # 过滤掉已删除的项目
+            valid_items = [item for item in items if item.get('trashed', 0) == 0]
+            logger.info(f"从缓存获取有效目录项: {parent_id} ({len(valid_items)}项)")
+            return valid_items
     return None
 
 
@@ -303,7 +341,11 @@ def get_cached_file_info(file_id):
 def get_path_for_file_id(file_id, parent_id):
     """构建文件/目录的完整路径"""
     if parent_id == 0:  # 根目录下的项目
-        return f"/{file_id}"
+        # 获取文件名
+        file_info = get_cached_file_info(file_id)
+        if file_info:
+            return f"/{file_info['filename']}"
+        return f"/{file_id}"  # 回退方案
 
     # 获取父目录路径
     conn = sqlite3.connect(DB_FILE)
@@ -331,7 +373,7 @@ def get_file_list(parent_file_id, target_name=None, target_type=None, force_refr
       target_type: 要查找的类型 (0=文件, 1=目录)
       force_refresh: 强制刷新缓存
     """
-    # 尝试从缓存获取
+    # 尝试从缓存获取（已过滤已删除项目）
     if not force_refresh:
         cached_data = get_cached_directory(parent_file_id)
         if cached_data:
@@ -344,18 +386,44 @@ def get_file_list(parent_file_id, target_name=None, target_type=None, force_refr
                     type_match = (target_type is None) or (item['type'] == target_type)
                     if name_match and type_match:
                         return item
-            return cached_data
+            else:
+                return cached_data
 
     # 缓存未命中或强制刷新，调用API
     logger.info(f"调用API获取目录: {parent_file_id}")
-    items = get_file_list_from_api(parent_file_id)
-    logger.info(f"调用API获取目录结果: {items}")
-    # 存储到缓存
+
+    try:
+        items = get_file_list_from_api(parent_file_id)
+    except FileNotFoundError:
+        # 目录不存在，清除相关缓存
+        logger.warning(f"目录不存在，清除缓存: {parent_file_id}")
+        delete_cached_path_by_id(parent_file_id)
+        # 重新尝试API调用
+        items = get_file_list_from_api(parent_file_id)
+
+    # 新增：如果目录内容为空，强制刷新父目录
+    if not items and parent_file_id != 0:
+        logger.warning(f"目录 {parent_file_id} 内容为空，强制刷新父目录")
+        parent_dir_id = get_parent_directory_id(parent_file_id)
+        if parent_dir_id:
+            logger.info(f"找到父目录ID: {parent_dir_id}")
+            # 强制刷新父目录
+            get_file_list(parent_dir_id, force_refresh=True)
+            # 重新获取当前目录内容
+            items = get_file_list_from_api(parent_file_id)
+            logger.info(f"刷新后目录内容: {len(items)}项")
+
+    # 存储到缓存（自动过滤已删除项目）
     cache_directory_contents(parent_file_id, items)
 
     # 如果有目标查找条件，检查结果
     if target_name:
         for item in items:
+            logger.warning(f"文件{item} ")
+            # 确保只处理未删除的项目
+            if item.get('trashed', 0) == 1:
+                continue
+
             name_match = f"{item['filename']}" == f"{target_name}"
             type_match = (target_type is None) or (item['type'] == target_type)
             if name_match and type_match:
@@ -366,22 +434,45 @@ def get_file_list(parent_file_id, target_name=None, target_type=None, force_refr
 
 
 def find_file_id_by_path(path, force_refresh=False, folder_type=False):
-    """根据路径查找文件ID（带缓存优化）"""
+    """根据路径查找文件ID（带缓存优化），添加全局重试机制"""
     # 清理路径格式
     path = re.sub(r'/{2,}', '/', path.strip().rstrip('/'))
+    logger.info(f"查找路径: {path} (强制刷新: {force_refresh})")
 
+    # 第一次尝试
+    try:
+        return _find_file_id_by_path(path, force_refresh, folder_type)
+    except FileNotFoundError as e:
+        logger.warning(f"首次查找失败: {path}, 错误: {str(e)}")
+        # 删除整个路径的缓存
+        delete_cached_path(path)
+
+        # 第二次尝试 - 从根目录强制刷新
+        logger.info("从根目录重新尝试查找...")
+        try:
+            return _find_file_id_by_path(path, True, folder_type)
+        except Exception as e2:
+            logger.error(f"全局重试失败: {path}, 错误: {str(e2)}")
+            raise FileNotFoundError(f"路径不存在: {path}") from e2
+
+def _find_file_id_by_path(path, force_refresh=False, folder_type=False):
+    """内部实现 - 根据路径查找文件ID"""
     # 尝试从路径缓存获取
     if not force_refresh:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT file_id FROM path_mapping WHERE path = ?", (path.lower(),))
+        c.execute("SELECT file_id, last_verified FROM path_mapping WHERE path = ?", (path.lower(),))
         row = c.fetchone()
         conn.close()
 
         if row:
-            file_id = row[0]
-            logger.info(f"从缓存获取路径映射: {path} -> {file_id}")
-            return file_id
+            file_id, last_verified = row
+            # 检查是否在最近验证过（5分钟内）
+            if time.time() - last_verified < 300:
+                logger.info(f"从缓存获取路径映射: {path} -> {file_id}")
+                return file_id
+            else:
+                logger.info(f"路径验证过期，重新验证: {path}")
 
     parts = [p for p in path.strip('/').split('/') if p]  # 拆分路径并移除空部分
     if not parts:
@@ -396,33 +487,57 @@ def find_file_id_by_path(path, force_refresh=False, folder_type=False):
 
         # 构建当前路径
         current_path = f"{current_path}/{part}" if current_path else f"/{part}"
+        logger.info(f"处理路径组件: {current_path} (类型: {target_type})")
 
-        # 查找当前项
-        found = get_file_list(
-            current_parent_id,
-            target_name=part,
-            target_type=target_type,
-            force_refresh=force_refresh
-        )
+        # 查找当前项（最多重试2次）
+        found = None
+        for attempt in range(2):
+            try:
+                found = get_file_list(
+                    current_parent_id,
+                    target_name=part,
+                    target_type=target_type,
+                    force_refresh=(force_refresh or attempt > 0)  # 强制刷新或重试时强制刷新
+                )
+                if found:
+                    # 检查找到的项目是否已被删除
+                    if found.get('trashed', 0) == 1:
+                        logger.warning(f"找到的项目已被删除: {part} (ID: {found['fileId']})")
+                        found = None
+                    else:
+                        break
+                else:
+                    # 如果未找到且不是最后一次尝试，继续重试
+                    if attempt < 1:
+                        logger.warning(f"首次查找未找到，强制刷新父目录: {current_parent_id}")
+                    else:
+                        raise FileNotFoundError(f"路径不存在: {current_path}")
+            except FileNotFoundError as e:
+                if attempt == 0:
+                    logger.warning(f"首次查找失败，强制刷新父目录: {current_parent_id}")
+                else:
+                    logger.error(f"路径查找失败: {current_path}")
+                    raise e
 
         if not found:
             raise FileNotFoundError(f"路径不存在: {current_path}")
 
         # 更新当前父ID
         current_parent_id = found['fileId']
+        logger.info(f"找到文件ID: {current_parent_id}")
 
         # 缓存当前路径映射
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
+        is_directory = 1 if (target_type == 1 or (is_last_component and folder_type)) else 0
         c.execute("""
-            INSERT OR REPLACE INTO path_mapping (path, file_id, is_directory)
-            VALUES (?, ?, ?)
-        """, (current_path.lower(), current_parent_id, 1 if target_type == 1 else 0))
+            INSERT OR REPLACE INTO path_mapping (path, file_id, is_directory, last_verified)
+            VALUES (?, ?, ?, ?)
+        """, (current_path.lower(), current_parent_id, is_directory, time.time()))
         conn.commit()
         conn.close()
 
     return current_parent_id
-
 
 def save_folder_to_db(path, max_depth=8):
     """保存指定文件夹到SQLite数据库（永久存储）"""
@@ -441,15 +556,22 @@ def save_folder_to_db(path, max_depth=8):
         # 获取目录内容（强制刷新）
         items = get_file_list(parent_id, force_refresh=True)
 
+        # 缓存目录内容
+        cache_directory_contents(parent_id, items)
+
         # 遍历目录项
         for item in items:
+            # 跳过已删除项目
+            if item.get('trashed', 0) == 1:
+                continue
+
             item_path = f"{current_path.rstrip('/')}/{item['filename']}"
 
             # 如果是目录且未达到深度限制，加入队列
             if item['type'] == 1 and depth < max_depth:
                 queue.append((item['fileId'], depth + 1, item_path))
 
-        saved_count += len(items)
+        saved_count += len([item for item in items if item.get('trashed', 0) == 0])
 
     return saved_count
 
@@ -458,18 +580,19 @@ def delete_cached_path(path):
     """删除指定路径的缓存"""
     # 清理路径格式
     path = re.sub(r'/{2,}', '/', path.strip().rstrip('/')).lower()
+    logger.info(f"删除缓存路径: {path}")
 
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
 
     try:
-        # 1. 删除路径映射
-        c.execute("DELETE FROM path_mapping WHERE path = ? OR path LIKE ?",
-                  (path, f"{path}/%"))
-
-        # 2. 获取关联的文件ID
+        # 1. 获取关联的文件ID
         c.execute("SELECT file_id FROM path_mapping WHERE path = ?", (path,))
         file_ids = [row[0] for row in c.fetchall()]
+
+        # 2. 删除路径映射
+        c.execute("DELETE FROM path_mapping WHERE path = ? OR path LIKE ?",
+                  (path, f"{path}/%"))
 
         # 3. 删除目录缓存
         if file_ids:
@@ -492,8 +615,49 @@ def delete_cached_path(path):
         conn.close()
 
 
+def delete_cached_path_by_id(file_id):
+    """根据文件ID删除缓存"""
+    logger.info(f"根据ID删除缓存: {file_id}")
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    try:
+        # 1. 获取关联的路径
+        c.execute("SELECT path FROM path_mapping WHERE file_id = ?", (file_id,))
+        paths = [row[0] for row in c.fetchall()]
+
+        # 2. 删除路径映射
+        c.execute("DELETE FROM path_mapping WHERE file_id = ?", (file_id,))
+
+        # 3. 删除目录缓存
+        c.execute("DELETE FROM directories WHERE file_id = ?", (file_id,))
+
+        # 4. 删除文件缓存
+        c.execute("DELETE FROM files WHERE file_id = ?", (file_id,))
+
+        conn.commit()
+        deleted_count = c.rowcount
+
+        # 5. 递归删除子路径
+        for path in paths:
+            if path:
+                c.execute("DELETE FROM path_mapping WHERE path LIKE ?", (f"{path}/%",))
+                conn.commit()
+
+        logger.info(f"根据ID删除缓存完成: {file_id} ({deleted_count}项)")
+        return deleted_count
+    except sqlite3.Error as e:
+        logger.error(f"根据ID删除缓存失败: {str(e)}")
+        return 0
+    finally:
+        conn.close()
+
+
 def get_download_url(file_id):
     """根据文件ID获取下载链接"""
+    logger.info(f"获取下载链接: {file_id}")
+
     # 检查缓存
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -502,6 +666,7 @@ def get_download_url(file_id):
 
     if row and row[0] and row[1] and time.time() < row[1]:
         conn.close()
+        logger.info(f"从缓存获取下载链接: {file_id}")
         return row[0]
 
     conn.close()
@@ -517,13 +682,22 @@ def get_download_url(file_id):
 
     response = requests.get(url, headers=headers)
     if response.status_code != 200:
+        # 文件不存在，清除相关缓存
+        if response.status_code == 404:
+            logger.warning(f"文件不存在，清除缓存: {file_id}")
+            delete_cached_path_by_id(file_id)
         raise Exception("下载API请求失败")
 
     data = response.json()
     if data['code'] != 0:
+        # 文件不存在，清除相关缓存
+        if data['code'] in [10004, 404]:
+            logger.warning(f"API返回文件不存在，清除缓存: {file_id}")
+            delete_cached_path_by_id(file_id)
         raise Exception(f"下载API错误: {data['message']}")
 
     download_url = data['data']['downloadUrl']
+    logger.info(f"获取到下载链接: {download_url[:50]}...")
 
     # 缓存下载链接（有效1小时）
     expires = time.time() + 3600
@@ -542,10 +716,14 @@ def get_download_url(file_id):
 def get_download_url_by_path(path):
     """根据路径获取下载链接（带缓存优化）"""
     try:
+        logger.info(f"获取路径下载链接: {path}")
         file_id = find_file_id_by_path(path)
         return get_download_url(file_id)
     except Exception as e:
         logger.error(f"获取下载链接失败: {str(e)}")
+        # 添加详细错误日志
+        import traceback
+        logger.error(f"详细错误信息: {traceback.format_exc()}")
         raise
 
 

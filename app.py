@@ -349,14 +349,14 @@ def get_file_list(parent_file_id, target_name=None, target_type=None, force_refr
     # 缓存未命中或强制刷新，调用API
     logger.info(f"调用API获取目录: {parent_file_id}")
     items = get_file_list_from_api(parent_file_id)
-
+    logger.info(f"调用API获取目录结果: {items}")
     # 存储到缓存
     cache_directory_contents(parent_file_id, items)
 
     # 如果有目标查找条件，检查结果
     if target_name:
         for item in items:
-            name_match = item['filename'] == target_name
+            name_match = f"{item['filename']}" == f"{target_name}"
             type_match = (target_type is None) or (item['type'] == target_type)
             if name_match and type_match:
                 return item

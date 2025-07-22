@@ -6,7 +6,7 @@ import sqlite3
 import json
 import logging
 from datetime import datetime, timezone
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, render_template,request, jsonify, redirect
 from collections import deque
 import re
 
@@ -71,7 +71,48 @@ init_db()
 access_token = None
 token_expiry = 0
 token_lock = threading.Lock()  # 用于线程安全的锁
+task_lock = threading.Lock()
+current_task = None
+task_history = deque(maxlen=20)  # 保存最近20条历史记录
+history_updated = False  # 跟踪历史记录是否更新
+# 默认配置
+DEFAULT_PARENT_ID = os.environ.get("PAN123_PARENT_ID", 0)
+# Base62 字符集
+BASE62_CHARS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
+def base62_to_hex(base62_str):
+    """将 Base62 编码的字符串转换为十六进制"""
+    # 验证输入是否为有效的 Base62 字符串
+    if not all(char in BASE62_CHARS for char in base62_str):
+        raise ValueError(f"Invalid Base62 string: {base62_str}")
+
+    # 转换为大整数
+    num = 0
+    for char in base62_str:
+        num = num * 62 + BASE62_CHARS.index(char)
+
+    # 转换为十六进制并补齐32位
+    hex_str = hex(num)[2:]  # 去掉 '0x' 前缀
+    hex_str = hex_str.lower()
+
+    # 补齐到32个字符
+    if len(hex_str) < 32:
+        hex_str = '0' * (32 - len(hex_str)) + hex_str
+
+    return hex_str
+
+
+def convert_etag_if_needed(file_info, uses_base62):
+    """如果需要，将 Base62 ETag 转换为十六进制格式"""
+    if not uses_base62:
+        return file_info["etag"]
+
+    try:
+        # print(f"转换 ETag: {file_info['etag']} -> {base62_to_hex(file_info['etag'])}")
+        return base62_to_hex(file_info["etag"])
+    except Exception as e:
+        print(f"ETag 转换失败: {e}")
+        return file_info["etag"]  # 返回原始值，让API处理
 
 # 速率限制器（令牌桶算法）
 class RateLimiter:
@@ -845,6 +886,311 @@ def cache_stats():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/token_info')
+def token_info():
+    """查看当前令牌信息（调试用）"""
+    try:
+        token = get_access_token()
+        return jsonify({
+            'access_token': token[:20] + '...',  # 部分显示
+            'expiry_time': datetime.fromtimestamp(token_expiry).isoformat(),
+            'seconds_remaining': int(token_expiry - time.time())
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# 秒传功能
+def sec_upload(parent_id, filename, etag, size, contain_dir=True):
+    """执行秒传操作 - 添加详细日志"""
+    token = get_access_token()
+    url = 'https://open-api.123pan.com/upload/v2/file/create'
+    headers = {
+        'Content-Type': 'application/json',
+        'Platform': 'open_platform',
+        'Authorization': f'Bearer {token}'
+    }
+    data = {
+        "parentFileID": parent_id,
+        "filename": filename,
+        "etag": etag,
+        "size": size,
+        "duplicate": 2,
+        "containDir": contain_dir
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=data)
+        result = response.json()
+        return result
+    except Exception as e:
+        return {"code": -1, "message": str(e)}
+
+
+def process_sec_upload_task(task_data):
+    """处理秒传任务"""
+    global current_task, history_updated
+
+    try:
+        # 解析文件范围
+        start_index = int(task_data.get("start_index", 1)) - 1  # 转换为0-based索引
+        end_index = int(task_data.get("end_index", 0))
+
+        # 如果end_index为0，表示处理到最后一个文件
+        if end_index == 0 or end_index > len(task_data["files"]):
+            end_index = len(task_data["files"])
+
+        # 确保索引在有效范围内
+        start_index = max(0, start_index)
+        end_index = min(len(task_data["files"]), end_index)
+
+        # 获取要处理的文件子集
+        files_to_process = task_data["files"][start_index:end_index]
+
+        with task_lock:
+            current_task = {
+                "status": "running",
+                "start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "total_files": len(files_to_process),
+                "processed": 0,
+                "success": 0,
+                "failed": 0,
+                "fail_list": [],
+                "current_file": "",
+                "parent_id": task_data["parent_id"],
+                "common_path": task_data["common_path"],
+                "uses_base62": task_data.get("uses_base62", False),
+                "cancelled": False,
+                "start_index": start_index + 1,  # 显示给用户的1-based索引
+                "end_index": end_index
+            }
+
+        # 处理每个文件
+        for idx, file_info in enumerate(files_to_process):
+            # 检查是否取消
+            with task_lock:
+                if current_task.get("cancelled", False):
+                    current_task["status"] = "cancelled"
+                    break
+
+            with task_lock:
+                current_task["current_file"] = file_info["path"]
+                current_task["processed"] = idx + 1
+
+            # 构建完整文件路径
+            full_path = os.path.join(task_data["common_path"], file_info["path"]).replace("\\", "/")
+
+            # 转换 ETag（如果需要）
+            etag = convert_etag_if_needed(
+                file_info,
+                task_data.get("uses_base62", False)
+            )
+
+            # 执行秒传
+            result = sec_upload(
+                parent_id=task_data["parent_id"],
+                filename=full_path,
+                etag=etag,
+                size=int(file_info["size"]),
+                contain_dir=True
+            )
+
+            # 处理结果
+            if result.get("code") == 0 and result.get("data", {}).get("reuse"):
+                with task_lock:
+                    current_task["success"] += 1
+            else:
+                error_msg = result.get("message", "未知错误")
+                with task_lock:
+                    current_task["failed"] += 1
+                    current_task["fail_list"].append({
+                        "path": full_path,
+                        "error": error_msg
+                    })
+
+            # 控制请求频率（每秒最多5次）
+            time.sleep(0.25)
+
+        # 任务完成
+        with task_lock:
+            if not current_task.get("cancelled", False):
+                current_task["status"] = "completed"
+            current_task["end_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # 添加到历史记录
+            task_history.append({
+                "start_time": current_task["start_time"],
+                "end_time": current_task["end_time"],
+                "total_files": current_task["total_files"],
+                "success": current_task["success"],
+                "failed": current_task["failed"],
+                "fail_list": current_task["fail_list"],
+                "status": current_task["status"],
+                "uses_base62": current_task["uses_base62"],
+                "start_index": current_task["start_index"],
+                "end_index": current_task["end_index"]
+            })
+            history_updated = True
+
+    except Exception as e:
+        with task_lock:
+            if current_task:
+                current_task["status"] = "failed"
+                current_task["error"] = str(e)
+                current_task["end_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                # 添加到历史记录
+                task_history.append({
+                    "start_time": current_task["start_time"],
+                    "end_time": current_task["end_time"],
+                    "total_files": current_task["total_files"],
+                    "success": current_task["success"],
+                    "failed": current_task["failed"],
+                    "fail_list": current_task["fail_list"],
+                    "status": "failed",
+                    "uses_base62": current_task["uses_base62"],
+                    "start_index": current_task["start_index"],
+                    "end_index": current_task["end_index"]
+                })
+                history_updated = True
+
+    finally:
+        # 重置当前任务
+        with task_lock:
+            current_task = None
+
+
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    global current_task, history_updated
+
+    if request.method == 'POST':
+        # 检查是否有任务正在运行
+        with task_lock:
+            if current_task:
+                return jsonify({
+                    "error": "当前已有任务运行中，请等待完成后再提交新任务"
+                }), 400
+
+        # 获取表单数据
+        parent_id = request.form.get('parent_id', DEFAULT_PARENT_ID)
+        start_index = request.form.get('start_index', '1')
+        end_index = request.form.get('end_index', '0')
+        file = request.files.get('json_file')
+
+        if not file:
+            return jsonify({"error": "请选择JSON文件"}), 400
+
+        try:
+            # 读取并解析JSON文件
+            json_data = json.load(file.stream)
+
+            # 验证JSON结构
+            required_fields = ["files", "commonPath"]
+            for field in required_fields:
+                if field not in json_data:
+                    return jsonify({"error": f"无效的JSON格式: 缺少 {field} 字段"}), 400
+
+            # 检查是否需要转换ETag
+            uses_base62 = json_data.get("usesBase62EtagsInExport", False)
+            print(f"检测到 usesBase62EtagsInExport: {uses_base62}")
+
+            # 启动后台任务
+            task_data = {
+                "parent_id": parent_id,
+                "common_path": json_data["commonPath"],
+                "files": json_data["files"],
+                "uses_base62": uses_base62,
+                "start_index": start_index,
+                "end_index": end_index
+            }
+
+            threading.Thread(
+                target=process_sec_upload_task,
+                args=(task_data,),
+                daemon=True
+            ).start()
+
+            return jsonify({
+                "message": "秒传任务已启动",
+                "total_files": len(json_data["files"]),
+                "start_index": start_index,
+                "end_index": end_index,
+                "uses_base62": uses_base62
+            })
+
+        except json.JSONDecodeError:
+            return jsonify({"error": "无效的JSON格式"}), 400
+        except Exception as e:
+            return jsonify({"error": f"处理错误: {str(e)}"}), 400
+
+    # GET请求显示页面
+    # 检查历史记录是否更新
+    refresh_history = False
+    with task_lock:
+        if history_updated:
+            refresh_history = True
+            history_updated = False
+
+    return render_template(
+        'index.html',
+        default_parent_id=DEFAULT_PARENT_ID,
+        history=list(task_history),
+        refresh_history=refresh_history
+    )
+
+
+@app.route('/task_status')
+def task_status():
+    """获取当前任务状态"""
+    with task_lock:
+        if current_task:
+            return jsonify(current_task)
+        return jsonify({"status": "idle"})
+
+
+@app.route('/cancel_task', methods=['POST'])
+def cancel_task():
+    """取消当前任务"""
+    with task_lock:
+        if current_task and current_task["status"] == "running":
+            current_task["cancelled"] = True
+            current_task["status"] = "cancelled"
+        #     # 添加到历史记录
+            task_history.append({
+                "start_time": current_task["start_time"],
+                "end_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "total_files": current_task["total_files"],
+                "success": current_task["success"],
+                "failed": current_task["failed"],
+                "fail_list": current_task["fail_list"],
+                "status": "cancelled",
+                "uses_base62": current_task["uses_base62"],
+                "start_index": current_task["start_index"],
+                "end_index": current_task["end_index"]
+            })
+        #     # 重置当前任务
+        #     current_task = None
+            return jsonify({"message": "任务已取消"})
+        return jsonify({"error": "没有正在运行的任务"}), 400
+
+
+@app.route('/history')
+def get_history():
+    """获取历史记录"""
+    with task_lock:
+        return jsonify(list(task_history))
+
+
+@app.route('/clear_history', methods=['POST'])
+def clear_history():
+    """清空历史记录"""
+    global task_history, history_updated
+    with task_lock:
+        task_history = deque(maxlen=20)
+        history_updated = True
+    return jsonify({"message": "历史记录已清空"})
 
 
 if __name__ == '__main__':

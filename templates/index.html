@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>123云盘秒传工具</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>123云盘秒传工具</h1>
+            <p class="subtitle">快速批量秒传文件到您的123云盘</p>
+        </header>
+
+        <main>
+            <section class="card config-section">
+                <h2><i class="icon icon-settings"></i> 秒传配置</h2>
+                <form id="uploadForm" method="post" enctype="multipart/form-data">
+                    <div class="form-group">
+                        <label for="parent_id">父目录ID:</label>
+                        <input type="text" id="parent_id" name="parent_id" value="{{ default_parent_id }}">
+                        <small>根目录请填写0</small>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="start_index">起始序号:</label>
+                            <input type="number" id="start_index" name="start_index" min="1" value="1">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="end_index">结束序号:</label>
+                            <input type="number" id="end_index" name="end_index" min="0" value="0">
+                            <small>(0表示处理所有文件)</small>
+                        </div>
+                    </div>
+
+                    <div class="form-group file-upload">
+                        <label for="json_file">上传JSON文件:</label>
+                        <!-- 修复：使用label包裹整个上传区域 -->
+                        <label for="json_file" class="upload-area" id="uploadArea">
+                            <i class="icon icon-upload"></i>
+                            <p>拖放JSON文件或点击选择</p>
+                            <!-- 文件输入元素保持在内部 -->
+                            <input type="file" id="json_file" name="json_file" accept=".json,.txt" style="display: none;">
+                        </label>
+                        <div id="fileName" class="file-name"></div>
+                    </div>
+
+                    <button type="submit" class="btn-primary">
+                        <i class="icon icon-start"></i> 开始秒传
+                    </button>
+                </form>
+            </section>
+
+            <section class="card status-section">
+                <h2><i class="icon icon-status"></i> 当前任务状态</h2>
+                <div id="taskStatus">
+                    <div id="statusMessage">没有正在进行的任务</div>
+                    <div class="progress-container">
+                        <div id="progressBar" class="progress-bar"></div>
+                    </div>
+                    <div id="progressDetails" class="progress-details"></div>
+                    <div class="action-buttons">
+                        <button id="cancelBtn" class="btn-cancel">
+                            <i class="icon icon-cancel"></i> 取消任务
+                        </button>
+                    </div>
+                </div>
+            </section>
+
+            <section class="card history-section">
+                <div class="section-header">
+                    <h2><i class="icon icon-history"></i> 历史记录</h2>
+                    <button id="clearHistory" class="btn-secondary">
+                        <i class="icon icon-clear"></i> 清空历史
+                    </button>
+                </div>
+
+                <div class="table-container">
+                    <table id="historyTable">
+                        <thead>
+                            <tr>
+                                <th>开始时间</th>
+                                <th>结束时间</th>
+                                <th>文件范围</th>
+                                <th>总文件数</th>
+                                <th>成功</th>
+                                <th>失败</th>
+                                <th>状态</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for task in history %}
+                            <tr class="history-row">
+                                <td>{{ task.start_time }}</td>
+                                <td>{{ task.end_time if task.end_time else '-' }}</td>
+                                <td>{{ task.start_index }} - {{ task.end_index }}</td>
+                                <td>{{ task.total_files }}</td>
+                                <td class="success">{{ task.success }}</td>
+                                <td class="error">{{ task.failed }}</td>
+                                <td>
+                                    {% if task.status == 'completed' %}
+                                        <span class="status-badge success">已完成</span>
+                                    {% elif task.status == 'cancelled' %}
+                                        <span class="status-badge warning">已取消</span>
+                                    {% elif task.status == 'failed' %}
+                                        <span class="status-badge error">失败</span>
+                                    {% else %}
+                                        <span class="status-badge">{{ task.status }}</span>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    {% if task.failed > 0 %}
+                                    <button class="btn-view-fail" data-id="{{ loop.index }}">
+                                        查看失败
+                                    </button>
+                                    {% endif %}
+                                </td>
+                            </tr>
+                            <tr class="fail-details" id="fail-details-{{ loop.index }}" style="display: none;">
+                                <td colspan="8">
+                                    <div class="fail-list">
+                                        <h3>失败文件列表 ({{ task.failed }})</h3>
+                                        <ul>
+                                            {% for fail in task.fail_list %}
+                                            <li>
+                                                <div class="fail-path">{{ fail.path }}</div>
+                                                <div class="fail-error">错误: {{ fail.error }}</div>
+                                            </li>
+                                            {% endfor %}
+                                        </ul>
+                                    </div>
+                                </td>
+                            </tr>
+                            {% else %}
+                            <tr>
+                                <td colspan="8" class="empty-row">暂无历史记录</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </main>
+
+        <footer>
+            <p>123云盘秒传工具 &copy; {{ now_year }} | 基于123云盘OpenAPI</p>
+        </footer>
+
+        <!-- 浮动提示框 -->
+        <div id="toast" class="toast"></div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/script.js') }}"></script>
+    <script>
+        // 设置当前年份
+        document.querySelector('footer p').innerHTML =
+            document.querySelector('footer p').innerHTML.replace('{{ now_year }}', new Date().getFullYear());
+
+        // 如果后端指示需要刷新历史记录
+        {% if refresh_history %}
+        setTimeout(() => {
+            location.reload();
+        }, 500);
+        {% endif %}
+    </script>
+</body>
+</html>

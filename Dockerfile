@@ -8,7 +8,9 @@ WORKDIR /app
 COPY . /app
 
 # 使用阿里云镜像加速安装依赖
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    -i https://mirrors.aliyun.com/pypi/simple/ \
+    --trusted-host mirrors.aliyun.com
 
 # 暴露应用运行的端口
 EXPOSE 1234

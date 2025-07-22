@@ -1,14 +1,21 @@
-更新：
+##### 更新：
 
 ```
+2025-07-22
+1、增加秒传功能
 2025-06-14
 1、现在打开更慢了，因为官方api1秒内只能获取十次文件夹，所以做了限制。
 2、但你先别急，好消息是增加了缓存，第二次访问比以前更快，无须访问文件夹。也可以事先缓存好！
 3、端口号改成了1234
 ```
 
-使用方法：
-1、下载这三个文件（app.py、Dockerfile、requirements.txt）放入nas，并获取在nas目录，比如：`/volume1/docker/container/cloud123`
+##### 需要开发者账号：
+
+https://www.123pan.com/developer
+
+##### 使用方法：
+
+1、下载放入nas（1.png和README.md删除），并获取在nas目录，比如：`/volume1/docker/container/cloud123`
 
 2、ssh连接nas，构建镜像
 
@@ -37,6 +44,7 @@ services:
     environment:
       - PAN123_CLIENT_ID=**********
       - PAN123_CLIENT_SECRET=******
+      - PAN123_PARENT_ID=*****默认秒传文件夹ID，https://www.123pan.com/?homeFilePath=1233%2C1194d%2C13258，这个填13258
 ```
 
 4、验证成功。假设123云盘根目录下abc目录下有一个1.txt
